@@ -87,7 +87,9 @@ CONF_GATE = 0.5
 # order until one answers — flat-rate plans first (Kimi Code, GLM Coding Plan),
 # pay-per-token OpenRouter last. Every slug must be routable by the local router.
 DRY_FRONTIER = ("kimi-code/k3", "zai-coding/glm-5.3", "openrouter/glm-5.3")
-DRY_STANDARD = ("zai-coding/glm-5.2", "kimi-code/kimi-for-coding", "openrouter/deepseek-v4.1-flash")
+# openrouter/deepseek-v4.1-flash is out: it intermittently streams a tool call at
+# output_index 1 before item 0, which the router refuses as non-sequential.
+DRY_STANDARD = ("zai-coding/glm-5.2", "kimi-code/kimi-for-coding", "openrouter/glm-5.3-flash")
 DRY_MANUAL_PATH = os.path.join(STATE, "jev-router.codex-dry")
 DRY_STATE_PATH = os.path.join(STATE, "jev-router.codex-dry.json")
 DRY_COOLDOWN_S = 30 * 60
@@ -426,6 +428,8 @@ class SummaryMarker:
         self._buf = ""
         self._block = []
         self._held = None  # (key, block_lines)
+        self._response_id = None  # id announced by response.created
+        self._indexes = {}  # upstream output_index -> sequential index
 
     @staticmethod
     def _emit(lines):
@@ -496,6 +500,42 @@ class SummaryMarker:
                             part["text"] = self._tag(part.get("text"))
         return self._rebuild(block, data)
 
+    def _pin_response_id(self, block, data):
+        """Keep response.completed on the id response.created announced.
+
+        The router's caller edge synthesizes Responses streams for chat-completions
+        providers (the dry chain) whose completed event carries a different id
+        than created; the router's own openai-responses adapter then refuses the
+        stream ("The Responses completion used a different response ID.") and the
+        client never sees response.completed. Native streams already match.
+        """
+        response = data.get("response")
+        if not self._response_id or not isinstance(response, dict):
+            return block
+        if response.get("id") in (None, self._response_id):
+            return block
+        response["id"] = self._response_id
+        return self._rebuild(block, data)
+
+    def _resequence(self, block, data):
+        """Renumber output_index by first appearance when the upstream skips one.
+
+        Synthesized streams sometimes open a tool call at output_index 1 without
+        ever opening item 0, which the router's adapter refuses ("non-sequential
+        output index"). In-order streams map to themselves and stay byte-exact.
+        """
+        index = data.get("output_index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            return block
+        mapped = self._indexes.setdefault(index, len(self._indexes))
+        if mapped == index:
+            return block
+        data["output_index"] = mapped
+        item = data.get("item")
+        if isinstance(item, dict) and isinstance(item.get("output_index"), int):
+            item["output_index"] = mapped
+        return self._rebuild(block, data)
+
     def _process_block(self, block):
         out = []
         data = self._data(block)
@@ -505,7 +545,10 @@ class SummaryMarker:
                 self._held = None
             out.append(self._emit(block))
             return out
+        block = self._resequence(block, data)
         dtype = data.get("type")
+        if dtype == "response.created" and self._response_id is None:
+            self._response_id = (data.get("response") or {}).get("id")
         if dtype == "response.reasoning_summary_text.delta":
             if self._held is not None:
                 out.append(self._emit(self._held[1]))
@@ -544,7 +587,7 @@ class SummaryMarker:
                 out.append(self._emit(self._tag_item_block(block)))
                 return out
         if dtype == "response.completed":
-            out.append(self._emit(self._tag_item_block(block)))
+            out.append(self._emit(self._tag_item_block(self._pin_response_id(block, data))))
             return out
         if self._held is not None:
             out.append(self._emit(self._held[1]))
